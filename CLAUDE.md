@@ -4,110 +4,107 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Reference Implementation
 
-The canonical reference is `../hislip-python-sdk`. Read it when designing Go equivalents — architecture, protocol constants, SCPI normalization rules, test patterns, and example instruments all port directly.
+The canonical reference is `../hislip-python-sdk`. Read it when designing Go equivalents — protocol constants, SCPI normalization rules, test patterns, and example instruments all port directly.
 
 ## Commands
 
 ```bash
-go build ./...                          # build all packages
-go test ./...                           # run all tests
-go test ./... -run TestName             # run a single test by name
-go test ./internal/engine/...           # test one package
-go vet ./...                            # static analysis
-golangci-lint run                       # lint
-gofmt -w .                             # format all files
-go run ./examples/multimeter/main.go   # run an example
+go build ./...                              # build library + all examples
+go test ./...                              # run all tests
+go test -run TestEngine_IDNQuery           # run a single test by name
+go test -run TestHiSLIP                    # run all protocol tests
+go vet ./...                               # static analysis
+gofmt -w .                                # format all files
+go run ./examples/multimeter/main.go      # run an example
 ```
 
-## Architecture
+## Package Structure
 
-The SDK is a Go port of `../hislip-python-sdk` with the same layered structure:
+Everything is in one flat package (`package hislip`) at the module root — no sub-packages. Import path: `github.com/arnc-carbon/hislip-go-sdk`.
 
 ```
-hislip-instruments/
-  internal/
-    engine/       # CommandEngine — SCPI string-in/string-out processor
-    command/      # ScpiCommand — parsed command passed to handlers
-    ports/        # Signal, InputPort, OutputPort — inter-instrument wiring
-  protocol/       # HiSLIPProtocol — TCP server (IVI-6.1)
-  instrument/     # Instrument interface + InstrumentBase struct
+command.go           # SCPICommand — parsed command passed to handlers
+engine.go            # CommandEngine — SCPI dispatch + IEEE 488.2 + property store
+ports.go             # Signal, InputPort, OutputPort — inter-instrument wiring
+protocol.go          # HiSLIP wire format, constants, session state, lock manager
+hislip_protocol.go   # HiSLIPProtocol — dual-channel TCP server (IVI-6.1)
+instrument.go        # Instrument interface + InstrumentBase embed pattern
+server.go            # HiSLIPServer — direct-use decorator-style API
 examples/
-  hello_world/
-  multimeter/
-  oscilloscope/
-  power_supply/
-  signal_generator/
-  bench/          # wired demo: signal generator → oscilloscope
-profiles/         # YAML instrument profiles for Carbon platform UI
-  carbon_dmm6500.yaml
-  ...
-go.mod
+  hello_world/       # Minimal instrument
+  multimeter/        # VirtualDMM — SCPI configure/measure
+  signal_generator/  # VirtualSG — waveform output port
+  oscilloscope/      # VirtualOSC — 4-channel, waveform data
+  power_supply/      # VirtualPSU — multi-channel, channel select
+  bench/             # Wired demo: SG OUTPUT → OSC CH1
 ```
 
-### CommandEngine (`internal/engine`)
+## Core Abstractions
 
-String-in / string-out SCPI processor. Thread-safe with `sync.RWMutex`. Responsibilities:
-- Register handlers: `engine.RegisterHandler("CONF:VOLT:DC", handlerFn)`
-- Dispatch: longest-prefix match, case-insensitive after normalization
-- Built-in IEEE 488.2: `*IDN?`, `*RST`, `*CLS`, `*STB?`, `*ESR?`, `*ESE`, `*SRE`, `*OPC?`
-- Property store: `SetProperty(key, val)` / `GetProperty(key)`
-- Reset hooks: registered callbacks invoked on `*RST`
-- SRQ generation: `GenerateSRQ()` → triggers async service request to all clients
+### CommandEngine (`engine.go`)
 
-SCPI normalization (must match Python exactly):
-- Strip leading colons, collapse `::` → `:`
-- Uppercase before matching
-- Queries end with `?`; args are comma-separated after the prefix
+String-in / optional string-out SCPI processor. Thread-safe with `sync.Mutex` (state) and `sync.RWMutex` (handler list).
 
-### HiSLIPProtocol (`protocol/`)
+- `RegisterHandler(prefix, handler)` — case-insensitive, longest prefix wins
+- `ProcessCommand(command)` — splits on `;`, dispatches each part
+- `AddResetHook(fn)` — called after `*RST` resets engine state; hooks run **outside** the lock, so they can safely call `SetProperty`
+- `SetProperty` / `GetProperty` — key/value store, uppercase keys
+- `GenerateSRQ()` — sets bit 6 of STB, fires `OnSRQ` callback outside the lock
 
-TCP server implementing IVI-6.1. Uses two TCP connections per client session.
+Handler type: `func(*SCPICommand) (string, bool)` — return `(response, true)` for queries, `("", false)` for writes.
 
-**Wire format** — 16-byte header + payload:
+SCPI normalization (matches Python exactly): strip leading colons, collapse `::` → `:`, uppercase before matching.
+
+### HiSLIPProtocol (`protocol.go` + `hislip_protocol.go`)
+
+IVI-6.1 TCP server. Each client session has two TCP connections on the same port:
+
+**Wire format** — 16-byte header + payload (big-endian):
 ```
 "HS" (2B) | msg_type (1B) | control_code (1B) | msg_param (4B) | payload_len (8B)
 ```
 
-**Dual-channel per session:**
-- Sync channel (port 4880): MSG_DATA*, MSG_TRIGGER, MSG_DEVICE_CLEAR_COMPLETE
-- Async channel (port 4880): MSG_ASYNC_INITIALIZE, MSG_ASYNC_STATUS_QUERY, MSG_ASYNC_LOCK, MSG_ASYNC_DEVICE_CLEAR, MSG_ASYNC_SERVICE_REQUEST
-
 **Initialization handshake:**
-1. Sync: client sends `MSG_INITIALIZE` (sub-address in payload, e.g. `"hislip0"`)
-2. Server responds `MSG_INITIALIZE_RESPONSE` with `(version << 16) | session_id`
-3. Async: client sends `MSG_ASYNC_INITIALIZE` (session_id in msg_param)
-4. Server responds `MSG_ASYNC_INITIALIZE_RESPONSE` with `VENDOR_ID = 0x00004342` in msg_param
+1. Sync: client sends `msgInitialize` (sub-address payload, e.g. `"hislip0"`)
+2. Server replies `msgInitializeResponse`: `msg_param = (version<<16) | session_id`
+3. Async: client sends `msgAsyncInitialize` (session_id in msg_param)
+4. Server replies `msgAsyncInitializeResponse`: `msg_param = VendorID (0x00004342)`
 
-**Device clear** is a 4-step handshake; see Python `protocol.py` for the exact sequence.
+Session goroutines: `syncLoop` (commands, triggers, device clear) + `asyncLoop` (lock, status, max-msg-size, SRQ).
 
-**Session state** is per-client: message IDs, lock ownership, MAV (Message AVailable) bit. Each session runs sync and async goroutines.
+Device clear is a 4-step handshake; see `syncLoop` / `asyncLoop` in `hislip_protocol.go`.
 
-### Instrument (`instrument/`)
+`safeProcessCommand` wraps `ProcessCommand` with `recover` so panicking handlers return an error string instead of crashing the session.
 
-```go
-type Instrument interface {
-    SetupCommands(engine *engine.CommandEngine)
-    OnInputChanged(port string, signal *ports.Signal)
-}
-```
+### InstrumentBase (`instrument.go`)
 
-`InstrumentBase` composes `CommandEngine`, a slice of protocols, and input/output ports. `Start()` calls `SetupCommands()` then begins accepting connections.
-
-### Ports (`internal/ports`)
+Embed pattern — struct embedding, not inheritance:
 
 ```go
-type Signal struct {
-    Value    float64
-    Unit     string
-    Metadata map[string]any  // frequency, offset, function type, etc.
+type VirtualDMM struct {
+    hislip.InstrumentBase
+    // instrument state
 }
+
+func (d *VirtualDMM) SetupCommands() { /* register handlers */ }
+func (d *VirtualDMM) OnInputChanged(port string, signal hislip.Signal) { /* react to wired signals */ }
+
+dmm := &VirtualDMM{...}
+dmm.Init(dmm, "ACME", "DMM100", "SN001", "1.0.0", true, ";", proto)
+dmm.Start()
 ```
 
-`OutputPort.Emit(signal)` broadcasts to all connected `InputPort`s, which call `OnInputChanged` on their owning instrument. Initial value propagates on `ConnectTo()`.
+`Init` requires the `self` pointer so `Start()` can call the overridden `SetupCommands`. `SetupCommands` is called once on the first `Start()` call.
 
-## HiSLIP Protocol Constants
+Wiring: `sg.Connect("OUTPUT", &osc.InstrumentBase, "CH1")` — uses `&osc.InstrumentBase` because `Connect` takes `*InstrumentBase`.
 
-See `MSG_*` type values in Python `protocol.py`. Critical ones: `MSG_DATA = 0x05`, `MSG_DATA_END = 0x06`, `MSG_INITIALIZE = 0x00`, `MSG_ASYNC_SERVICE_REQUEST = 0x10`.
+### Ports (`ports.go`)
+
+`OutputPort.ConnectTo(input)` propagates the current signal immediately (initial state). `OutputPort.Emit(signal)` fans out to all connected inputs. `InputPort.receive` calls the `onChange` callback (set by `AddInput` to call `OnInputChanged`).
+
+## HiSLIP Message Constants
+
+Defined in `protocol.go` as unexported constants (`msgInitialize`, `msgDataEnd`, etc.) matching the Python values. See the const block for the full list (0–23).
 
 ## VISA Resource String
 
@@ -115,18 +112,8 @@ See `MSG_*` type values in Python `protocol.py`. Critical ones: `MSG_DATA = 0x05
 TCPIP0::127.0.0.1::hislip0::INSTR
 ```
 
-Default port: **4880**. Sub-address `hislip0` is validated during initialization.
+Default port: **4880**. Sub-address `hislip0` validated on sync-channel init.
 
-## go.mod Dependencies
+## go.mod
 
-Expected dependencies:
-- `gopkg.in/yaml.v3` — profile deserialization
-
-Optional build tag `mdns`:
-- `github.com/grandcat/zeroconf` — for `_hislip._tcp.local.` advertisement
-
-The core protocol and engine should use only the standard library (`net`, `sync`, `encoding/binary`, `log`).
-
-## Profiles
-
-YAML files in `profiles/` describe SCPI variables and commands for the Carbon platform UI. Match the structure in `../hislip-python-sdk/profiles/`. Not parsed by the SDK itself — consumed by the Carbon platform.
+No external dependencies. Core uses: `encoding/binary`, `io`, `net`, `sync`, `sync/atomic`, `log`, `strconv`.
