@@ -1,0 +1,19 @@
+# Build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+/bin/
+
+# Test cache
+/tmp/
+
+# Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go workspace
+go.work
+go.work.sum
